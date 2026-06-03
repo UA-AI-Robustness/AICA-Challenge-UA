@@ -74,8 +74,8 @@ INTENTION_TRANSFER_FROM_DRONE = 4
 INTENTION_TRANSFER_TO_DRONE = 5
 
 # Scenario constants from the documentation
-ARRIVAL_TOLERANCE_M = 2.0          # Horizontal distance tolerance for arrival
-HOLD_DURATION_SEC = 3.0            # Required hold time for any action
+ARRIVAL_TOLERANCE_M = 2          # Horizontal distance tolerance for arrival
+HOLD_DURATION_SEC = 3.1            # Required hold time for any action
 ROADMAP_SCALE_FACTOR = 10.0        # Matches setup_env.py
 
 
@@ -85,6 +85,7 @@ class MissionAction:
     target_node: int               # Which node to drive to
     intention: int                 # Action intention to set when arrived
     description: str = ""          # Human-readable label for logging
+    hold_duration: float = HOLD_DURATION_SEC   # default 3.8s, can override
 
 
 @dataclass
@@ -92,8 +93,8 @@ class CarMissionState:
     """Tracks the car's overall mission progress."""
     actions: List[MissionAction] = field(default_factory=list)
     current_action_idx: int = 0
-    cargo_small_count: int = 0
-    cargo_large_count: int = 0
+    cargo_small_count: int = 0 # Up to 2 small packages
+    cargo_large_count: int = 0 # Up to 1 large package
 
     @property
     def current_action(self) -> Optional[MissionAction]:
@@ -167,6 +168,68 @@ def build_mission_delivery4_only() -> CarMissionState:
     ]
     return mission
 
+def build_mission_delivery5_only() -> CarMissionState:
+    """
+    Stub mission for Phase 2: drive to central pickup, pick up the large
+    package (delivery 5), drive to delivery 5's drop-off, drop it off.
+
+    Tests the new INTENTION_PICKUP_LARGE intention end-to-end.
+
+    Coordinates from the competition Pickup and Delivery Table:
+      Central pickup (node 24): [-2.50305, 29.6703]
+      Delivery 5 ground (node 10): [-12.8205, -4.5991]  (large package only)
+    """
+    mission = CarMissionState()
+    mission.actions = [
+        MissionAction(
+            target_node=24,
+            intention=INTENTION_PICKUP_LARGE,
+            description="Pickup large package at central pickup"
+        ),
+        MissionAction(
+            target_node=10,
+            intention=INTENTION_DROPOFF,
+            description="Drop off large package at Delivery 5"
+        ),
+    ]
+    return mission
+
+
+def build_mission_deliveries_4_and_5() -> CarMissionState:
+    """
+    Combined mission: deliver D4 (small) and D5 (large) in one run.
+
+    The car must visit pickup separately for each because it can't batch
+    a small with a large (different package types).
+
+    Sequence:
+      pickup → D4 → pickup → D5
+    """
+    mission = CarMissionState()
+    mission.actions = [
+        MissionAction(
+            target_node=24,
+            intention=INTENTION_PICKUP_SMALL,
+            description="Pickup small package #1 at central pickup"
+        ),
+        MissionAction(
+            target_node=22,
+            intention=INTENTION_DROPOFF,
+            description="Drop off small package at Delivery 4"
+        ),
+        MissionAction(
+            target_node=24,
+            intention=INTENTION_PICKUP_LARGE,
+            description="Pickup large package at central pickup"
+        ),
+        MissionAction(
+            target_node=10,
+            intention=INTENTION_DROPOFF,
+            description="Drop off large package at Delivery 5"
+        ),
+    ]
+    return mission
+    
 # =============================================================================
 # Utility Functions
 # =============================================================================
@@ -393,7 +456,7 @@ send_commands = np.array([0., 0.], dtype=np.float64)
 roadmap = SDCSRoadMap(leftHandTraffic=False, useSmallMap=False)
 
 # Build the mission (hardcoded for now; will be replaced by planner later)
-mission = build_mission_delivery4_only()
+mission = build_mission_deliveries_4_and_5()
 print(f"Mission loaded with {len(mission.actions)} actions:")
 for i, action in enumerate(mission.actions):
     print(f"  [{i}] {action.description}")
@@ -452,10 +515,6 @@ try:
                 vel_cmd = 0.1
                 intention = INTENTION_NOTHING
 
-        elif car_state == CarState.APPROACHING_NODE:
-            # Drive toward target; check for arrival
-            action = mission.current_action
-            target_xy = get_node_location_xy(roadmap, action.target_node)
 
             if has_arrived(pose, target_xy):
                 # We're at the target; switch to hold state and set the right intention
@@ -473,24 +532,25 @@ try:
 
         elif car_state == CarState.AT_NODE_HOLDING:
             # Stay put with current intention until 3-second hold completes
-            vel_cmd = 0.0
             # intention already set in previous transition
 
-            if hold_completed(hold_start_time, current_time):
-                # Action done; advance the mission
+            if hold_completed(hold_start_time, current_time, duration=action.hold_duration):
                 action = mission.current_action
-                print(f"[STATE] HOLD COMPLETE: {action.description}")
+                actual_hold = current_time - hold_start_time
+                print(f"[STATE] HOLD COMPLETE: {action.description}, "
+                      f"actual_duration={actual_hold:.2f}s")
 
-                # Track cargo changes based on intention
+            # Track cargo changes
                 if action.intention == INTENTION_PICKUP_SMALL:
                     mission.cargo_small_count += 1
                 elif action.intention == INTENTION_PICKUP_LARGE:
                     mission.cargo_large_count += 1
                 elif action.intention == INTENTION_DROPOFF:
-                    if mission.cargo_small_count > 0:
-                        mission.cargo_small_count -= 1
-                    elif mission.cargo_large_count > 0:
+                    # Drop off whatever we're carrying; large takes precedence
+                    if mission.cargo_large_count > 0:
                         mission.cargo_large_count -= 1
+                    elif mission.cargo_small_count > 0:
+                        mission.cargo_small_count -= 1
 
                 # Update where we are; next path will start from here
                 current_start_node = action.target_node
@@ -540,9 +600,27 @@ try:
                 receiveGameCounter = 0
                 pose = client_car.receiveBuffer[0]
 
-        # ---------------- Control Computation ----------------
+# ---------------- Control Computation ----------------
         # Compute velocity and steering using Stanley controller
         vel_cmd, steering_cmd = stanley_controller(pose, vel_cmd, path_pose)
+
+        # Force hard stop when we're at the target during a hold phase.
+        # This is critical for the game's pickup/drop-off detection.
+        if car_state in (CarState.APPROACHING_NODE, CarState.AT_NODE_HOLDING):
+            action = mission.current_action
+            if action is not None:
+                target_xy = get_node_location_xy(roadmap, action.target_node)
+                dist_to_target = np.linalg.norm(pose[:2] - target_xy)
+
+                if dist_to_target <= ARRIVAL_TOLERANCE_M:
+                    vel_cmd = 0.0
+                    steering_cmd = 0.0
+                elif car_state == CarState.AT_NODE_HOLDING:
+                    # Car drifted out of the target zone — reset hold
+                    print(f"[STATE] Drifted out of target zone (dist={dist_to_target:.2f}m); resetting hold")
+                    hold_start_time = None
+                    car_state = CarState.APPROACHING_NODE
+
         send_commands = np.array([vel_cmd, steering_cmd], dtype=np.float64)
 
         # ---------------- Server Communication ----------------
