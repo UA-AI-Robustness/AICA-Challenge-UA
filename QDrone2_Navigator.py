@@ -91,11 +91,13 @@ WINDOW_Z_THRESHOLD_M = 4.0
 @dataclass
 class DroneMissionAction:
     """A single action in the drone's mission plan."""
-    target_xyz: np.ndarray         # 3D position to fly to (numpy array of shape (3,))
-    target_yaw: float = 0.0        # Desired yaw at the target (radians)
+    target_xyz: np.ndarray
+    target_yaw: float = 0.0
     intention: int = DRONE_INTENTION_NOTHING
     description: str = ""
     hold_duration: float = DRONE_HOLD_DURATION_SEC
+    via_points: Optional[List[np.ndarray]] = None       # Optional intermediate waypoints (for building avoidance)
+    flight_time_override: Optional[float] = None        # Optional custom flight time (for long routes)
 
 
 @dataclass
@@ -191,6 +193,78 @@ def build_drone_mission_simple() -> DroneMissionState:
     ]
     return mission
 
+# Delivery 2 requires multi-waypoint routing because a direct line from pickup
+# to its window passes through a building. These intermediate waypoints route
+# the drone around the obstacle at a safe altitude (mentor-derived).
+D2_SAFE_ALTITUDE = 13.0
+
+# Mentor's proven D2 approach: one via-point at safe altitude near the pickup,
+# then a single diagonal descent into the window. Two segments total, giving
+# the drone time per segment to track the trajectory smoothly.
+D2_APPROACH_1 = np.array([0.0, 29.0, D2_SAFE_ALTITUDE])
+
+
+def build_drone_mission_three_windows() -> DroneMissionState:
+    """
+    Drone delivers small packages to all three window destinations.
+
+    Ordering rationale (estimated best non-handoff sequence):
+      1. D3 first — closest to pickup, bank the +200 bonus quickly
+      2. D1 second — biggest bonus (+400), preserves value
+      3. D2 last — building avoidance makes it longest, save for end
+
+    Sequence:
+      Spawn → pickup → D3 window → pickup → D1 window → pickup → D2 window
+    """
+    pickup_xyz = np.array([-2.50305, 29.6703, DRONE_CRUISE_ALTITUDE_M])
+    d1_window_xyz = apply_window_z_buffer(np.array([15.1739, -18.04655, 9.65]))
+    d2_window_xyz = apply_window_z_buffer(np.array([26.0478, 16.7703, 9.65]))
+    d3_window_xyz = apply_window_z_buffer(np.array([1.3, 46.9735, 4.85]))
+
+    mission = DroneMissionState()
+    mission.actions = [
+        # Pickup small #1
+        DroneMissionAction(
+            target_xyz=pickup_xyz,
+            intention=DRONE_INTENTION_PICKUP_SMALL,
+            description="Pickup small #1 at central pickup"
+        ),
+        # Drop at D3 window (floor 2, +200)
+        DroneMissionAction(
+            target_xyz=d3_window_xyz,
+            intention=DRONE_INTENTION_DROPOFF,
+            description="Drop off at Delivery 3 window (floor 2, +200)"
+        ),
+        # Pickup small #2
+        DroneMissionAction(
+            target_xyz=pickup_xyz,
+            intention=DRONE_INTENTION_PICKUP_SMALL,
+            description="Pickup small #2 at central pickup"
+        ),
+        # Drop at D1 window (floor 4, +400)
+        DroneMissionAction(
+            target_xyz=d1_window_xyz,
+            intention=DRONE_INTENTION_DROPOFF,
+            description="Drop off at Delivery 1 window (floor 4, +400)"
+        ),
+        # Pickup small #3
+        DroneMissionAction(
+            target_xyz=pickup_xyz,
+            intention=DRONE_INTENTION_PICKUP_SMALL,
+            description="Pickup small #3 at central pickup"
+        ),
+        # Drop at D2 window (floor 3, +300) — building avoidance required
+        # Via-points: climb out and around the building, descend to window altitude
+        # outside the building, then approach horizontally to the window.
+        DroneMissionAction(
+            target_xyz=d2_window_xyz,
+            intention=DRONE_INTENTION_DROPOFF,
+            description="Drop off at Delivery 2 window (floor 3, +300) via single climb-out waypoint",
+            via_points=[D2_APPROACH_1],  # only one via-point (mentor's proven approach)
+            flight_time_override=D2_WINDOW_FLIGHT_TIME_SEC,
+        ),
+    ]
+    return mission
 # =============================================================================
 # Trajectory Generation
 # =============================================================================
@@ -494,7 +568,7 @@ hover_command = initial_position + np.array([0.0, 0.0, DRONE_CRUISE_ALTITUDE_M, 
 send_commands = hover_command.copy()
 
 # Build the mission (hardcoded for now; will be replaced by planner later)
-mission = build_drone_mission_simple()
+mission = build_drone_mission_three_windows()
 print(f"Drone mission loaded with {len(mission.actions)} actions:")
 for i, action in enumerate(mission.actions):
     print(f"  [{i}] {action.description}")
@@ -522,29 +596,34 @@ try:
 # Handle current state; may transition to next state.
 
         if drone_state == DroneState.IDLE:
-            # First-time setup: build trajectory from current pose to first target
             if not mission.is_complete:
                 action = mission.current_action
 
                 is_window = action.target_xyz[2] >= WINDOW_Z_THRESHOLD_M
                 flight_time = WINDOW_FLIGHT_TIME_SEC if is_window else DEFAULT_FLIGHT_TIME_SEC
 
-                # If we're starting near ground level, add a takeoff via-point
-                # so the drone climbs straight up before translating horizontally.
+                # Action-specific flight time override (e.g., long D2 route)
+                if action.flight_time_override is not None:
+                    flight_time = action.flight_time_override
+
+                # Build via-point list: takeoff if near ground, plus action-specific via-points
                 start = pose[:3].copy()
-                via = None
-                if start[2] < 1.5:  # near ground
+                via = []
+                if start[2] < 1.5:
                     takeoff_xyz = np.array([start[0], start[1], DRONE_CRUISE_ALTITUDE_M])
-                    via = [takeoff_xyz]
-                    flight_time += 4.0  # add takeoff time
+                    via.append(takeoff_xyz)
+                    flight_time += 4.0
                     print(f"[TRAJ] Adding takeoff via-point at {takeoff_xyz}")
+                if action.via_points is not None:
+                    via.extend(action.via_points)
+                    print(f"[TRAJ] Using {len(action.via_points)} action-specific via-points")
 
                 current_trajectory = make_trajectory(
                     start_xyz=start,
                     end_xyz=action.target_xyz,
                     current_time=current_time,
                     duration=flight_time,
-                    via_points=via,
+                    via_points=via if via else None,
                 )
                 intention = DRONE_INTENTION_NOTHING
                 flag_send_intention = True
@@ -627,17 +706,22 @@ try:
                 drone_state = DroneState.MISSION_COMPLETE
                 print(f"[STATE] MISSION COMPLETE at t={current_time:.1f}s")
             else:
-                # Build trajectory for next target
                 action = mission.current_action
 
                 is_window = action.target_xyz[2] >= WINDOW_Z_THRESHOLD_M
                 flight_time = WINDOW_FLIGHT_TIME_SEC if is_window else DEFAULT_FLIGHT_TIME_SEC
+
+                if action.flight_time_override is not None:
+                    flight_time = action.flight_time_override
+
+                via = list(action.via_points) if action.via_points is not None else None
 
                 current_trajectory = make_trajectory(
                     start_xyz=pose[:3].copy(),
                     end_xyz=action.target_xyz,
                     current_time=current_time,
                     duration=flight_time,
+                    via_points=via,
                 )
                 intention = DRONE_INTENTION_NOTHING
                 flag_send_intention = True
