@@ -1,4 +1,4 @@
 # Initial car position: x, y, z, yaw degree
--7.4888, 11.0093, 0.2, 180.0000
+-2.50305, 27.7, 0.2, 90.0
 # Initial drone position: x, y, z, yaw degree
-0, 0, 0, 0
+-2.50305, 29.6703, 3.0, 0
