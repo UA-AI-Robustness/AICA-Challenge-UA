@@ -1,14 +1,34 @@
 # =============================================================================
-# QDrone2 Navigator — restored to exact 5675 known-good configuration
+# QDrone2 Navigator — 5675 delivery  +  SURVEY_MODE data-collection
 # -----------------------------------------------------------------------------
-# Reverted the continuous-intention-resend "fix" - it introduced a regression
-# (D2 and D3 pickups/drops failed). Returning to the proven send-once-per-
-# state-transition pattern that achieved 5648/5670/5675.
+# Two modes, selected by SURVEY_MODE:
+#
+#   SURVEY_MODE = False  -> the proven 5675 single-assignment delivery mission,
+#                           UNCHANGED, no cameras, no capture (clean submission).
+#
+#   SURVEY_MODE = True   -> data-collection survey. The drone visits a ring of
+#                           viewpoints around each window + the pickup pad,
+#                           sweeping yaw at each, and captures RGB+depth+pose
+#                           for building a YOLO dataset with viewpoint DIVERSITY
+#                           (so the detector generalizes, rather than overfitting
+#                           to one trajectory).
+#
+# LAG FIX: in survey mode the camera is read ONLY while hovering at a fixed
+# survey point. During a hover the command is a constant position (not a
+# time-interpolated trajectory), so a slow camera read cannot desync flight.
+# No camera reads happen during the flight legs between points.
+#
+# Disk writes run in a BACKGROUND THREAD so they never block the loop.
 # =============================================================================
 
 import numpy as np
 import cv2
+import json
+import time
+import queue
+import threading
 from pathlib import Path
+from datetime import datetime
 
 try:
     from quanser.common import Timeout
@@ -22,6 +42,39 @@ from pal.utilities.vision import Camera2D, Camera3D
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import Optional, List
+
+
+# =============================================================================
+# MODE + CAPTURE CONFIG
+# =============================================================================
+SURVEY_MODE = True                  # True = collect dataset; False = clean 5675 delivery
+
+CAPTURE_INTERVAL_SEC = 0.75         # while hovering at a survey point, save this often
+CAPTURE_QUEUE_MAX = 128             # drop frames rather than block flight if writer lags
+CAPTURE_DEPTH = False               # Phase 1 needs only RGB; depth stream is heavy. Off = lighter.
+SURVEY_CAM_FPS = 10                 # low camera stream rate to reduce sim load (was 30)
+SURVEY_ARRIVAL_TIMEOUT_SEC = 18.0   # if a viewpoint can't be reached in time, skip it (no freeze)
+CAPTURE_DIR = Path("captures")
+CAPTURE_RGB_DIR = CAPTURE_DIR / "rgb"
+CAPTURE_DEPTH_DIR = CAPTURE_DIR / "depth"
+CAPTURE_DEPTH_VIEW_DIR = CAPTURE_DIR / "depth_view"
+CAPTURE_META_DIR = CAPTURE_DIR / "meta"
+
+# --- survey geometry (tune to trade dataset size vs run time) ---------------
+# Targets to survey: name -> (x, y, z) world position of the object.
+SURVEY_TARGETS = {
+    "d1_window": (15.1739, -18.04655, 9.65),
+    "d2_window": (26.0478, 16.7703, 9.65),
+    "d3_window": (1.3, 46.9735, 4.85),
+    "pickup":    (-2.50305, 29.6703, 3.0),
+}
+SURVEY_RING_RADIUS_M = 7.0                 # horizontal distance from target to viewpoint
+SURVEY_RING_BEARINGS_DEG = [0, 90, 180, 270]   # viewpoint positions around the target
+SURVEY_YAWS_DEG = [0, 90, 180, 270]        # camera yaw sweep at each viewpoint
+SURVEY_TRANSIT_ALT_M = 15.0                # fly between points at this safe altitude
+SURVEY_HOLD_SEC = 3.5                      # hover time per viewpoint (allow settle + rotate)
+SURVEY_APPROACH_SEC = 8.0                  # flight time to a new ring position
+SURVEY_YAW_TURN_SEC = 2.5                  # time for an in-place yaw change
 
 
 class DroneState(Enum):
@@ -59,6 +112,8 @@ class DroneMissionAction:
     hold_duration: float = DRONE_HOLD_DURATION_SEC
     via_points: Optional[List[np.ndarray]] = None
     flight_time_override: Optional[float] = None
+    capture_here: bool = False          # survey: capture frames during this hold
+    target_name: str = ""               # survey: which object this viewpoint targets
 
 
 @dataclass
@@ -155,6 +210,45 @@ def build_drone_mission_three_windows() -> DroneMissionState:
     return mission
 
 
+def build_survey_mission() -> DroneMissionState:
+    """Ring of viewpoints around each target, with a yaw sweep at each, for
+    diverse dataset capture. Camera is read only during these (stationary) holds."""
+    mission = DroneMissionState()
+    actions: List[DroneMissionAction] = []
+
+    for name, (tx, ty, tz) in SURVEY_TARGETS.items():
+        for bearing_deg in SURVEY_RING_BEARINGS_DEG:
+            b = np.deg2rad(bearing_deg)
+            vp_x = tx + SURVEY_RING_RADIUS_M * np.cos(b)
+            vp_y = ty + SURVEY_RING_RADIUS_M * np.sin(b)
+            vp_z = max(tz, DRONE_CRUISE_ALTITUDE_M)   # don't go below cruise
+
+            for k, yaw_deg in enumerate(SURVEY_YAWS_DEG):
+                yaw = np.deg2rad(yaw_deg)
+                if k == 0:
+                    # First yaw at this position: fly in via a safe transit altitude.
+                    via = [np.array([vp_x, vp_y, SURVEY_TRANSIT_ALT_M])]
+                    ft = SURVEY_APPROACH_SEC
+                else:
+                    # Same position, just rotate: quick in-place move.
+                    via = None
+                    ft = SURVEY_YAW_TURN_SEC
+                actions.append(DroneMissionAction(
+                    target_xyz=np.array([vp_x, vp_y, vp_z]),
+                    target_yaw=yaw,
+                    intention=DRONE_INTENTION_NOTHING,
+                    description=f"survey {name} bearing={bearing_deg} yaw={yaw_deg}",
+                    hold_duration=SURVEY_HOLD_SEC,
+                    via_points=via,
+                    flight_time_override=ft,
+                    capture_here=True,
+                    target_name=name,
+                ))
+
+    mission.actions = actions
+    return mission
+
+
 DEFAULT_FLIGHT_TIME_SEC = 12.0
 WINDOW_FLIGHT_TIME_SEC = 16.0
 
@@ -231,28 +325,124 @@ def load_plan_file(plan_path: Path):
     return qdrone2_wp1, qdrone2_t1
 
 
+# =============================================================================
+# THREADED DATA CAPTURE
+# =============================================================================
+class CaptureWriter(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.q = queue.Queue(maxsize=CAPTURE_QUEUE_MAX)
+        self._stop = threading.Event()
+        self.written = 0
+        self.dropped = 0
+
+    def setup_dirs(self):
+        for d in (CAPTURE_DIR, CAPTURE_RGB_DIR, CAPTURE_DEPTH_DIR,
+                  CAPTURE_DEPTH_VIEW_DIR, CAPTURE_META_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def next_index(self) -> int:
+        existing = sorted(CAPTURE_RGB_DIR.glob("frame_*.png"))
+        if not existing:
+            return 0
+        try:
+            return int(existing[-1].stem.split("_")[-1]) + 1
+        except ValueError:
+            return len(existing)
+
+    def submit(self, item) -> bool:
+        try:
+            self.q.put_nowait(item)
+            return True
+        except queue.Full:
+            self.dropped += 1
+            return False
+
+    @staticmethod
+    def _depth_to_view(depth: np.ndarray) -> np.ndarray:
+        d = depth.astype(np.float32)
+        finite = d[np.isfinite(d)]
+        if finite.size == 0:
+            return np.zeros((d.shape[0], d.shape[1], 3), dtype=np.uint8)
+        lo, hi = np.percentile(finite, 2), np.percentile(finite, 98)
+        if hi <= lo:
+            hi = lo + 1.0
+        norm = np.clip((d - lo) / (hi - lo), 0.0, 1.0)
+        return cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+
+    def run(self):
+        while not (self._stop.is_set() and self.q.empty()):
+            try:
+                item = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                idx, rgb, depth, pose, state_name, desc, target_name = item
+                name = f"frame_{idx:04d}"
+                ts = time.time()
+                cv2.imwrite(str(CAPTURE_RGB_DIR / f"{name}.png"), rgb)
+                if depth is not None:
+                    np.save(CAPTURE_DEPTH_DIR / f"{name}.npy", depth)
+                    cv2.imwrite(str(CAPTURE_DEPTH_VIEW_DIR / f"{name}.png"),
+                                self._depth_to_view(depth))
+                meta = {
+                    "frame": name,
+                    "wall_time": ts,
+                    "iso_time": datetime.fromtimestamp(ts).isoformat(),
+                    "drone_pose_xyzyaw": [float(v) for v in np.asarray(pose).tolist()],
+                    "drone_state": state_name,
+                    "current_action": desc,
+                    "survey_target": target_name,
+                    "has_depth": depth is not None,
+                    "depth_units": ("raw_PX (unscaled)" if depth is not None else "none"),
+                    "depth_min": float(np.nanmin(depth)) if depth is not None else None,
+                    "depth_max": float(np.nanmax(depth)) if depth is not None else None,
+                }
+                with (CAPTURE_META_DIR / f"{name}.json").open("w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2)
+                self.written += 1
+            except Exception as e:
+                print(f"[CAPTURE] writer error: {e}")
+            finally:
+                self.q.task_done()
+
+    def stop(self):
+        self._stop.set()
+
+
 simulationTime = 10000
 frequency = 200
 frameRate = 30
 CameraCounts = int(round(frequency / frameRate))
-useCameras = False
+
+useCameras = True if SURVEY_MODE else False
 
 counter = 0
 receiveCounter = 0
 receivedData = np.zeros(16)
 
+capture_idx = 0
+last_capture_time = -1e9
+writer: Optional[CaptureWriter] = None
+
 initial_position = read_initial_positions(Path("spawn_locations.txt"))
 plan_path = Path(r"tools\QDrone2_PathPlanning\qdrone2_plans.npz")
 qdrone2_wp1, qdrone2_t1 = load_plan_file(plan_path)
 
+if SURVEY_MODE:
+    writer = CaptureWriter()
+    writer.setup_dirs()
+    capture_idx = writer.next_index()
+    writer.start()
+    print(f"[SURVEY] Survey + capture mode ON. Saving to {CAPTURE_DIR.resolve()}")
+    print(f"[SURVEY] Starting at frame index {capture_idx}")
+
 if useCameras:
-    realsense = Camera3D(deviceId="0@tcpip://localhost:18986", mode='RGB&DEPTH',
-        frameWidthRGB=640, frameHeightRGB=480, frameRateRGB=frameRate,
-        frameWidthDepth=640, frameHeightDepth=480, frameRateDepth=frameRate, readMode=0)
-    camRight = Camera2D(cameraId="0@tcpip://localhost:18982", frameWidth=640, frameHeight=480, frameRate=frameRate)
-    camBack  = Camera2D(cameraId="1@tcpip://localhost:18983", frameWidth=640, frameHeight=480, frameRate=frameRate)
-    camLeft  = Camera2D(cameraId="2@tcpip://localhost:18984", frameWidth=640, frameHeight=480, frameRate=frameRate)
-    camDown  = Camera2D(cameraId="3@tcpip://localhost:18985", frameWidth=640, frameHeight=480, frameRate=frameRate)
+    _cam_mode = 'RGB&DEPTH' if CAPTURE_DEPTH else 'RGB'
+    realsense = Camera3D(deviceId="0@tcpip://localhost:18986", mode=_cam_mode,
+        frameWidthRGB=640, frameHeightRGB=480, frameRateRGB=SURVEY_CAM_FPS,
+        frameWidthDepth=640, frameHeightDepth=480, frameRateDepth=SURVEY_CAM_FPS, readMode=0)
+    print(f"[SURVEY] RealSense mode={_cam_mode} at {SURVEY_CAM_FPS} fps")
 
 
 dataStream = BasicStream(
@@ -289,16 +479,23 @@ else:
     print(f"[INIT] Drone spawn on ground (z={initial_position[2]:.2f}); will take off to {DRONE_CRUISE_ALTITUDE_M}m.")
 send_commands = hover_command.copy()
 
-mission = build_drone_mission_three_windows()
-print(f"Drone mission loaded with {len(mission.actions)} actions:")
-for i, action in enumerate(mission.actions):
-    ft = action.flight_time_override if action.flight_time_override is not None else "default"
-    print(f"  [{i}] {action.description} (flight_time={ft})")
-print(f"Settings: hold={DRONE_HOLD_DURATION_SEC}s")
+if SURVEY_MODE:
+    mission = build_survey_mission()
+    print(f"[SURVEY] mission loaded with {len(mission.actions)} viewpoints "
+          f"({len(SURVEY_TARGETS)} targets x {len(SURVEY_RING_BEARINGS_DEG)} bearings "
+          f"x {len(SURVEY_YAWS_DEG)} yaws)")
+else:
+    mission = build_drone_mission_three_windows()
+    print(f"Drone mission loaded with {len(mission.actions)} actions:")
+    for i, action in enumerate(mission.actions):
+        ft = action.flight_time_override if action.flight_time_override is not None else "default"
+        print(f"  [{i}] {action.description} (flight_time={ft})")
+print(f"Settings: hold={DRONE_HOLD_DURATION_SEC}s, survey={SURVEY_MODE}")
 
 drone_state = DroneState.IDLE
 hold_start_time: Optional[float] = None
 current_trajectory: Optional[DroneTrajectory] = None
+approach_start_time: float = 0.0
 
 pose = np.array([
     initial_position[0],
@@ -346,6 +543,7 @@ try:
                 intention = DRONE_INTENTION_NOTHING
                 flag_send_intention = True
                 drone_state = DroneState.APPROACHING_WAYPOINT
+                approach_start_time = current_time
                 print(f"[STATE] IDLE -> APPROACHING_WAYPOINT "
                       f"(target=({action.target_xyz[0]:.2f}, "
                       f"{action.target_xyz[1]:.2f}, {action.target_xyz[2]:.2f}), "
@@ -371,12 +569,51 @@ try:
                 drone_state = DroneState.AT_WAYPOINT_HOLDING
                 print(f"[STATE] ARRIVED at target at t={current_time:.1f}s; "
                       f"holding for {action.hold_duration}s with intention={action.intention}")
+            elif SURVEY_MODE and (current_time - approach_start_time) > SURVEY_ARRIVAL_TIMEOUT_SEC:
+                # Could not reach this survey viewpoint in time (too far, or
+                # blocked). Skip it rather than freezing here forever.
+                print(f"[SURVEY] viewpoint unreachable after "
+                      f"{SURVEY_ARRIVAL_TIMEOUT_SEC:.0f}s; skipping to next.")
+                mission.advance()
+                hold_start_time = None
+                drone_state = DroneState.ACTION_COMPLETE
 
         elif drone_state == DroneState.AT_WAYPOINT_HOLDING:
             action = mission.current_action
             send_commands = np.array([
                 action.target_xyz[0], action.target_xyz[1], action.target_xyz[2], action.target_yaw,
             ], dtype=np.float64)
+
+            # ---- SURVEY CAPTURE: read camera + save ONLY while hovering ----
+            # Drone is commanded to a FIXED position here, so a slow camera read
+            # cannot desync flight (unlike during a time-interpolated leg).
+            if SURVEY_MODE and action.capture_here and writer is not None and \
+                    useCameras and (current_time - last_capture_time) >= CAPTURE_INTERVAL_SEC:
+                realsense.read_RGB()
+                rgb_buf = realsense.imageBufferRGB
+                if CAPTURE_DEPTH:
+                    realsense.read_depth(dataMode='PX')
+                    depth_buf = realsense.imageBufferDepthPX
+                else:
+                    depth_buf = None
+                if rgb_buf is not None:
+                    rgb_arr = np.asarray(rgb_buf)
+                    depth_arr = (np.asarray(depth_buf, dtype=np.float32)
+                                 if depth_buf is not None else None)
+                    if rgb_arr.size:
+                        ok = writer.submit((
+                            capture_idx, rgb_arr.copy(),
+                            depth_arr.copy() if depth_arr is not None else None,
+                            np.asarray(pose).copy(), drone_state.name,
+                            action.description, action.target_name,
+                        ))
+                        if ok:
+                            last_capture_time = current_time
+                            if capture_idx % 10 == 0:
+                                print(f"[CAPTURE] queued frame_{capture_idx:04d} "
+                                      f"[{action.target_name}] "
+                                      f"pose=({pose[0]:.1f},{pose[1]:.1f},{pose[2]:.1f})")
+                            capture_idx += 1
 
             if hold_completed_drone(hold_start_time, current_time, duration=action.hold_duration):
                 actual_hold = current_time - hold_start_time
@@ -393,7 +630,9 @@ try:
                 hold_start_time = None
                 drone_state = DroneState.ACTION_COMPLETE
             else:
-                if not has_arrived_drone(pose, action.target_xyz):
+                # In survey mode we tolerate small position error during the hold
+                # (the drone may still be settling); only reset if WAY off.
+                if not SURVEY_MODE and not has_arrived_drone(pose, action.target_xyz):
                     print(f"[STATE] Drifted out of tolerance during hold; resetting")
                     hold_start_time = None
                     current_trajectory = make_trajectory(
@@ -421,6 +660,7 @@ try:
                 intention = DRONE_INTENTION_NOTHING
                 flag_send_intention = True
                 drone_state = DroneState.APPROACHING_WAYPOINT
+                approach_start_time = current_time
                 print(f"[STATE] ACTION_COMPLETE -> APPROACHING_WAYPOINT "
                       f"(target=({action.target_xyz[0]:.2f}, "
                       f"{action.target_xyz[1]:.2f}, {action.target_xyz[2]:.2f}), "
@@ -460,22 +700,6 @@ try:
                 receivedData = dataStream.receiveBuffer[0]
                 pose = get_drone_pose_safe(receivedData, fallback_pose=send_commands)
 
-            if useCameras and counter % CameraCounts == 0:
-                frameLeft = camLeft.read()
-                frameRight = camRight.read()
-                frameBack = camBack.read()
-                frameDown = camDown.read()
-                realsense.read_RGB()
-                realsense.read_depth()
-                if frameLeft or frameRight or frameBack or frameDown:
-                    cv2.imshow("Left Drone Image", camLeft.imageData)
-                    cv2.imshow("Right Drone Image", camRight.imageData)
-                    cv2.imshow("Back Drone Image", camBack.imageData)
-                    cv2.imshow("Downwards Drone Image", camDown.imageData)
-                    cv2.imshow("Front RGB Drone Image", realsense.imageBufferRGB)
-                    cv2.imshow("Front Depth Drone Image", realsense.imageBufferDepthPX)
-                    cv2.waitKey(1)
-
             counter += 1
 
             sentFlag = dataStream.send(send_commands)
@@ -495,13 +719,15 @@ except Exception as e:
     print("="*60)
 finally:
     print("\n--- Cleanup ---")
+    if SURVEY_MODE and writer is not None:
+        print("[CAPTURE] Flushing remaining frames to disk...")
+        writer.stop()
+        writer.join(timeout=60)
+        print(f"[CAPTURE] Wrote {writer.written} frame(s), dropped {writer.dropped}. "
+              f"Output: {CAPTURE_DIR.resolve()}")
     try:
         if useCameras:
             realsense.terminate()
-            camLeft.terminate()
-            camBack.terminate()
-            camRight.terminate()
-            camDown.terminate()
     except Exception as cleanup_err:
         print(f"Camera cleanup error: {cleanup_err}")
     try:

@@ -1,0 +1,28 @@
+# =============================================================================
+# data.yaml — YOLO dataset config for the AICA perception module
+# -----------------------------------------------------------------------------
+# This describes the dataset to Ultralytics for training. If you label in
+# Roboflow, it EXPORTS its own data.yaml — use that one instead and ignore this.
+# This template is for the LOCAL labeling route (CVAT / LabelImg) where you
+# organize the folders yourself with setup_dataset.py.
+#
+# Paths are relative to this file's location (the dataset root).
+# =============================================================================
+
+path: .                 # dataset root
+train: images/train     # train images (labels auto-found in labels/train)
+val: images/val         # val images   (labels auto-found in labels/val)
+
+# -----------------------------------------------------------------------------
+# CLASSES — PLACEHOLDER. Confirm/edit against your ACTUAL captured images.
+# You may find some of these aren't visually distinguishable in the sim (e.g.
+# all windows look alike -> use one 'delivery_window' class), or that you need
+# to split/merge. Decide this when you see real frames, then keep it consistent
+# across labeling, training, and perception.py.
+# -----------------------------------------------------------------------------
+names:
+  0: delivery_window
+  1: pickup_pad
+  2: dropoff_pad
+  3: package
+  4: qcar2

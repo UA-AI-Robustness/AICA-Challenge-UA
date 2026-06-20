@@ -1,0 +1,7 @@
+﻿
+# perception pipeline generated data
+captures/
+dataset/
+dataset_inbox/
+*.pt
+runs/
