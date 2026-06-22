@@ -1,6 +1,6 @@
 # Training the AICA detector on Google Colab (free GPU)
 
-Your laptop is CPU-only (AMD), so training happens on Colab's free GPU. You
+My laptop is CPU-only (AMD), so training happens on Colab's free GPU. You
 label and use the model locally; only the training step goes to the cloud.
 Inference (`perception.py`) runs fine on your laptop CPU afterward.
 
